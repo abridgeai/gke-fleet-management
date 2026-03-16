@@ -142,7 +142,7 @@ func TestDetector_RealIncident_2026_01_30(t *testing.T) {
 	// 12, 12, 12, 12, 12, 12, 12, 6, 12, 12, 12...
 	incidentPattern := []int{12, 12, 12, 12, 12, 12, 12, 6, 12}
 
-	var detectedAt int = -1
+	detectedAt := -1
 	for i, count := range incidentPattern {
 		isTransient, reason := detector.IsTransientIssue(count)
 		if isTransient && detectedAt == -1 {
