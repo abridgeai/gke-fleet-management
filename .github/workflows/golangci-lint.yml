@@ -47,3 +47,7 @@ jobs:
           version: latest
           working-directory: ${{ matrix.folder }}
           args: --timeout=5m
+      - if: steps.changes.outputs.src == 'true'
+        name: go-test
+        working-directory: ${{ matrix.folder }}
+        run: go test -v -race -count=1 ./...

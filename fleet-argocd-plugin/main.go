@@ -36,6 +36,7 @@ func getProtectionConfig() *fleetclient.ProtectionConfig {
 		DetectionWindow:      time.Duration(getEnvInt("DETECTION_WINDOW_MINUTES", 10)) * time.Minute,
 		OscillationThreshold: getEnvInt("OSCILLATION_THRESHOLD", 2),
 		DropThreshold:        float64(getEnvInt("DROP_THRESHOLD_PERCENT", 30)) / 100.0,
+		DeletionGracePeriod:  time.Duration(getEnvInt("DELETION_GRACE_PERIOD_SECONDS", 60)) * time.Second,
 	}
 }
 
@@ -61,12 +62,13 @@ func main() {
 
 	// Get protection configuration
 	protectionConfig := getProtectionConfig()
-	log.Printf("Protection config: MaxRetries=%d, CacheMaxAge=%v, DetectionWindow=%v, OscillationThreshold=%d, DropThreshold=%.0f%%",
+	log.Printf("Protection config: MaxRetries=%d, CacheMaxAge=%v, DetectionWindow=%v, OscillationThreshold=%d, DropThreshold=%.0f%%, DeletionGracePeriod=%v",
 		protectionConfig.MaxRetries,
 		protectionConfig.CacheMaxAge,
 		protectionConfig.DetectionWindow,
 		protectionConfig.OscillationThreshold,
 		protectionConfig.DropThreshold*100,
+		protectionConfig.DeletionGracePeriod,
 	)
 
 	// Start fleet client with protection
@@ -143,6 +145,7 @@ func Reply(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		fmt.Printf("Error rendering result: %v\n", err)
 		http.Error(w, "Error rendering result", http.StatusInternalServerError)
+		return
 	}
 	// Encode plugin response.
 	response := PluginResponse{
