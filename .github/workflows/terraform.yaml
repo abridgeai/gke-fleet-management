@@ -12,10 +12,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v5
+    - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       name: Checkout source code
 
-    - uses: terraform-linters/setup-tflint@v5
+    - uses: terraform-linters/setup-tflint@6770de8d186019a148cc2b144e8bfa627f7d4aa8 # v5
       name: Setup TFLint
       with:
         tflint_version: latest
