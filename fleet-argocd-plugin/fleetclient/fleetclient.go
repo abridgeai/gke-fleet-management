@@ -16,10 +16,14 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log"
+	"math"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
 
+	"fleet-management-tools/argocd-sync/protection"
 	fleet "google.golang.org/api/gkehub/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -65,6 +69,20 @@ stringData:
 `
 )
 
+// ProtectionConfig holds configuration for transient issue protection
+type ProtectionConfig struct {
+	MaxRetries           int
+	RetryBaseDelay       time.Duration
+	CacheMaxAge          time.Duration
+	DetectionWindow      time.Duration
+	OscillationThreshold int
+	DropThreshold        float64
+	DeletionGracePeriod  time.Duration
+}
+
+// clusterSecretTmpl is the parsed template for cluster secrets, parsed once at package init.
+var clusterSecretTmpl = template.Must(template.New("secret").Parse(clusterSecretTemplate))
+
 // FleetSync is a client that periodically polls the GKE Fleet API and caches fleet information.
 type FleetSync struct {
 	svc *fleet.Service
@@ -74,17 +92,59 @@ type FleetSync struct {
 	MembershipTenancyMapCache map[string][]string
 	// A cached map from Scope IDs to a list of Membership full resource names.
 	ScopeTenancyMapCache map[string][]string
+
+	// cacheMu protects MembershipTenancyMapCache and ScopeTenancyMapCache
+	cacheMu sync.RWMutex
+
+	// Reusable Kubernetes clientset, created once in NewFleetSync
+	clientset kubernetes.Interface
+
+	// Protection logic
+	cache    *protection.Cache
+	detector *protection.Detector
+	config   *ProtectionConfig
 }
 
-// NewFleetSync creates a new FleetSync and starts its periodical reconciliation.
-func NewFleetSync(ctx context.Context, projectNum string) (*FleetSync, error) {
+// NewFleetSync creates a new FleetSync with protection logic and starts its periodical reconciliation.
+func NewFleetSync(ctx context.Context, projectNum string, config *ProtectionConfig) (*FleetSync, error) {
 	service, err := fleet.NewService(ctx)
 	if err != nil {
 		return nil, err
 	}
+
+	// Default configuration if not provided
+	if config == nil {
+		config = &ProtectionConfig{
+			MaxRetries:           3,
+			RetryBaseDelay:       2 * time.Second,
+			CacheMaxAge:          60 * time.Minute,
+			DetectionWindow:      10 * time.Minute,
+			OscillationThreshold: 2,
+			DropThreshold:        0.3,
+			DeletionGracePeriod:  60 * time.Second,
+		}
+	}
+	if config.DeletionGracePeriod == 0 {
+		config.DeletionGracePeriod = 60 * time.Second
+	}
+
+	// Create Kubernetes clientset once for reuse across reconciliation cycles
+	k8sConfig, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get in cluster config: %w", err)
+	}
+	clientset, err := kubernetes.NewForConfig(k8sConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Kubernetes clientset: %w", err)
+	}
+
 	c := &FleetSync{
 		svc:        service,
 		ProjectNum: projectNum,
+		clientset:  clientset,
+		cache:      protection.NewCache(config.CacheMaxAge),
+		detector:   protection.NewDetector(config.DetectionWindow, config.OscillationThreshold, config.DropThreshold),
+		config:     config,
 	}
 
 	// Build the initial fleet topology before handling RPCs.
@@ -98,10 +158,17 @@ func NewFleetSync(ctx context.Context, projectNum string) (*FleetSync, error) {
 
 func (c *FleetSync) startReconcile(ctx context.Context) {
 	go func() {
+		ticker := time.NewTicker(reconcileInterval)
+		defer ticker.Stop()
 		for {
-			time.Sleep(reconcileInterval)
-			if err := c.Refresh(ctx); err != nil {
-				fmt.Printf("Error refreshing fleet: %v\n", err)
+			select {
+			case <-ticker.C:
+				if err := c.Refresh(ctx); err != nil {
+					fmt.Printf("Error refreshing fleet: %v\n", err)
+				}
+			case <-ctx.Done():
+				log.Println("Reconciliation loop stopped")
+				return
 			}
 		}
 	}()
@@ -116,6 +183,9 @@ type Result struct {
 
 // PluginResults returns the results of the plugin.
 func (c *FleetSync) PluginResults(ctx context.Context, scopeID string) ([]Result, error) {
+	c.cacheMu.RLock()
+	defer c.cacheMu.RUnlock()
+
 	if c.MembershipTenancyMapCache == nil || c.ScopeTenancyMapCache == nil {
 		return nil, fmt.Errorf("fleet is empty")
 	}
@@ -210,9 +280,11 @@ func (c *FleetSync) Refresh(ctx context.Context) error {
 		scopeTenancyMap[scope] = append(scopeTenancyMap[scope], membership)
 	}
 
-	// Refresh cache.
+	// Refresh cache under write lock.
+	c.cacheMu.Lock()
 	c.MembershipTenancyMapCache = memTenancyMap
 	c.ScopeTenancyMapCache = scopeTenancyMap
+	c.cacheMu.Unlock()
 
 	// Update cluster Secrets.
 	if err := c.reconcileClusterSecrets(ctx); err != nil {
@@ -222,16 +294,7 @@ func (c *FleetSync) Refresh(ctx context.Context) error {
 }
 
 func (c *FleetSync) reconcileClusterSecrets(ctx context.Context) error {
-	// Create a Kubernetes clientset to apply resources.
-	config, err := rest.InClusterConfig()
-	if err != nil {
-		return fmt.Errorf("failed to get in cluster config: %w", err)
-	}
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		return fmt.Errorf("failed to create Kubernetes clientset: %w", err)
-	}
-
+	c.cacheMu.RLock()
 	// Construct a map of cluster secrets, from name to manifest.
 	clusterSecrets := make(map[string]string)
 	for membership := range c.MembershipTenancyMapCache {
@@ -244,31 +307,28 @@ func (c *FleetSync) reconcileClusterSecrets(ctx context.Context) error {
 			Name:              secretName,
 			ConnectGatewayURL: connectGatewayURL(c.ProjectNum, parts[3], parts[5]),
 		}
-		tmpl, err := template.New("secret").Parse(clusterSecretTemplate)
-		if err != nil {
-			return fmt.Errorf("failed to parse template: %w", err)
-		}
 		var secretManifest bytes.Buffer
-		err = tmpl.Execute(&secretManifest, param)
+		err := clusterSecretTmpl.Execute(&secretManifest, param)
 		if err != nil {
 			fmt.Println("Error creating Secret manifest:", err)
 			continue
 		}
 		clusterSecrets[secretName] = secretManifest.String()
 	}
+	c.cacheMu.RUnlock()
+
 	fmt.Printf("Reconciling Cluster Secrets: %v\n", clusterSecrets)
 
 	// Apply the Secret to the cluster.
-	err = applySecrets(ctx, clientset, clusterSecrets)
-	if err != nil {
+	if err := applySecrets(ctx, c.clientset, clusterSecrets); err != nil {
 		return fmt.Errorf("failed to apply secret: %w", err)
 	}
 
 	// Prune cluster secrets that are no longer existing in the Fleet.
-	return pruneSecrets(ctx, clientset, clusterSecrets)
+	return pruneSecrets(ctx, c.clientset, clusterSecrets, c.config.DeletionGracePeriod)
 }
 
-func applySecrets(ctx context.Context, clientset *kubernetes.Clientset, clusterSecrets map[string]string) error {
+func applySecrets(ctx context.Context, clientset kubernetes.Interface, clusterSecrets map[string]string) error {
 	secretsClient := clientset.CoreV1().Secrets("argocd")
 	for _, manifest := range clusterSecrets {
 		secret, err := secretFromManifest(manifest)
@@ -291,28 +351,82 @@ func applySecrets(ctx context.Context, clientset *kubernetes.Clientset, clusterS
 	return nil
 }
 
-func pruneSecrets(ctx context.Context, clientset *kubernetes.Clientset, clusterSecrets map[string]string) error {
+func pruneSecrets(ctx context.Context, clientset kubernetes.Interface, clusterSecrets map[string]string, gracePeriod time.Duration) error {
 	secretsClient := clientset.CoreV1().Secrets("argocd")
-	listOptions := metav1.ListOptions{
+	existingSecrets, err := secretsClient.List(ctx, metav1.ListOptions{
 		LabelSelector: "argocd.argoproj.io/secret-type=cluster",
-	}
-
-	existingSecrets, err := secretsClient.List(ctx, listOptions)
+	})
 	if err != nil {
 		return fmt.Errorf("failed to list secrets: %w", err)
 	}
 
+	// Warning when many secrets absent
+	fleetManaged, absent := 0, 0
 	for _, secret := range existingSecrets.Items {
-		// Skip secrets that are not managed by the fleet plugin.
 		if secret.Annotations["fleet.gke.io/managed-by-fleet-plugin"] != "true" {
 			continue
 		}
+		fleetManaged++
 		if _, exists := clusterSecrets[secret.Name]; !exists {
-			// Secret no longer corresponds to a membership, delete it.
-			err := secretsClient.Delete(ctx, secret.Name, metav1.DeleteOptions{})
-			if err != nil {
-				return fmt.Errorf("failed to delete secret: %w", err)
+			absent++
+		}
+	}
+	if fleetManaged > 0 && float64(absent)/float64(fleetManaged) > 0.3 {
+		log.Printf("CRITICAL WARNING: %d/%d fleet secrets (%.0f%%) absent — possible Fleet API issue",
+			absent, fleetManaged, float64(absent)/float64(fleetManaged)*100)
+	}
+
+	for _, secret := range existingSecrets.Items {
+		if secret.Annotations["fleet.gke.io/managed-by-fleet-plugin"] != "true" {
+			continue
+		}
+
+		_, stillExists := clusterSecrets[secret.Name]
+		absentSince := secret.Annotations["fleet.gke.io/absent-since"]
+
+		if stillExists {
+			// Membership is present — remove absent-since annotation if it was set
+			if absentSince != "" {
+				log.Printf("Membership recovered for secret %s, removing absent-since annotation", secret.Name)
+				delete(secret.Annotations, "fleet.gke.io/absent-since")
+				if _, err := secretsClient.Update(ctx, &secret, metav1.UpdateOptions{}); err != nil {
+					return fmt.Errorf("failed to update secret %s: %w", secret.Name, err)
+				}
 			}
+			continue
+		}
+
+		// Membership absent — two-phase deletion
+		if absentSince == "" {
+			log.Printf("Membership absent for secret %s — marking (grace period: %v)", secret.Name, gracePeriod)
+			if secret.Annotations == nil {
+				secret.Annotations = make(map[string]string)
+			}
+			secret.Annotations["fleet.gke.io/absent-since"] = time.Now().Format(time.RFC3339)
+			if _, err := secretsClient.Update(ctx, &secret, metav1.UpdateOptions{}); err != nil {
+				return fmt.Errorf("failed to update secret %s: %w", secret.Name, err)
+			}
+			continue
+		}
+
+		markedTime, err := time.Parse(time.RFC3339, absentSince)
+		if err != nil {
+			log.Printf("Invalid absent-since on %s, resetting: %v", secret.Name, err)
+			secret.Annotations["fleet.gke.io/absent-since"] = time.Now().Format(time.RFC3339)
+			if _, err := secretsClient.Update(ctx, &secret, metav1.UpdateOptions{}); err != nil {
+				return fmt.Errorf("failed to update secret %s: %w", secret.Name, err)
+			}
+			continue
+		}
+
+		if elapsed := time.Since(markedTime); elapsed < gracePeriod {
+			log.Printf("Secret %s absent for %v / %v — waiting", secret.Name, elapsed.Round(time.Second), gracePeriod)
+			continue
+		}
+
+		log.Printf("Secret %s absent beyond grace period — deleting", secret.Name)
+		if err := secretsClient.Delete(ctx, secret.Name, metav1.DeleteOptions{}); err != nil {
+			return fmt.Errorf("failed to delete secret %s: %w", secret.Name, err)
 		}
 	}
 
@@ -371,7 +485,74 @@ func (c *FleetSync) listScopes(ctx context.Context, project string) ([]*fleet.Sc
 }
 
 // listMembershipBindings fetches the membership bindings under a given parent.
+// listMembershipBindings fetches the membership bindings with transient issue protection.
 func (c *FleetSync) listMembershipBindings(ctx context.Context, project string) ([]*fleet.MembershipBinding, error) {
+	for attempt := 0; attempt < c.config.MaxRetries; attempt++ {
+		// Call Fleet API
+		bindings, err := c.listMembershipBindingsInternal(ctx, project)
+		if err != nil {
+			if attempt < c.config.MaxRetries-1 {
+				delay := c.config.RetryBaseDelay * time.Duration(math.Pow(2, float64(attempt)))
+				log.Printf("Fleet API error (attempt %d/%d), retrying in %v: %v",
+					attempt+1, c.config.MaxRetries, delay, err)
+				select {
+				case <-time.After(delay):
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+				continue
+			}
+
+			// All retries failed, try cache
+			if cached, ok := c.cache.Get(); ok {
+				log.Printf("Fleet API failed after %d attempts, using cached response (age: %v)",
+					c.config.MaxRetries, c.cache.Age())
+				return cached, nil
+			}
+
+			return nil, fmt.Errorf("fleet API failed after %d attempts and no valid cache: %w",
+				c.config.MaxRetries, err)
+		}
+
+		// Check for transient issue
+		itemCount := len(bindings)
+		if isTransient, reason := c.detector.IsTransientIssue(itemCount); isTransient {
+			log.Printf("Transient issue detected: %s", reason)
+
+			if attempt < c.config.MaxRetries-1 {
+				delay := c.config.RetryBaseDelay * time.Duration(math.Pow(2, float64(attempt)))
+				log.Printf("Retrying Fleet API (attempt %d/%d) in %v", attempt+1, c.config.MaxRetries, delay)
+				select {
+				case <-time.After(delay):
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+				continue
+			}
+
+			// Retries exhausted, use cache
+			if cached, ok := c.cache.Get(); ok {
+				log.Printf("Transient issue persists after %d attempts, using cached response (age: %v)",
+					c.config.MaxRetries, c.cache.Age())
+				return cached, nil
+			}
+
+			// Fix: refuse to return suspicious data when cache is unavailable
+			return nil, fmt.Errorf("transient issue detected (%s) after %d attempts with no valid cache: refusing suspicious data",
+				reason, c.config.MaxRetries)
+		}
+
+		// Response looks good, cache it
+		c.cache.Set(bindings)
+		log.Printf("Fleet API success: %d membership bindings", itemCount)
+		return bindings, nil
+	}
+
+	return nil, fmt.Errorf("unexpected retry loop exit")
+}
+
+// listMembershipBindingsInternal is the original implementation (renamed from listMembershipBindings)
+func (c *FleetSync) listMembershipBindingsInternal(ctx context.Context, project string) ([]*fleet.MembershipBinding, error) {
 	var ret []*fleet.MembershipBinding
 	parent := fmt.Sprintf("projects/%s/locations/-/memberships/-", project)
 	call := c.svc.Projects.Locations.Memberships.Bindings.List(parent)

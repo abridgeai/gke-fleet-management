@@ -14,8 +14,10 @@ spec:
             scopeID: "$TEAM_ID"
         requeueAfterSeconds: 10
     syncPolicy:
-      applicationsSync: sync
-      preserveResourcesOnDeletion: false
+      # IMPORTANT: Use create-update to prevent app deletion when Fleet API returns partial data
+      applicationsSync: create-update
+      # Preserve K8s resources even if Application is deleted
+      preserveResourcesOnDeletion: true
     template:
       metadata:
         name: '{{name}}-webserver'
@@ -28,6 +30,3 @@ spec:
           path: guestbook
           repoURL: https://github.com/argoproj/argocd-example-apps.git
           targetRevision: HEAD
-    syncPolicy:
-      # The controller will delete Applications when the ApplicationSet is deleted.
-      preserveResourcesOnDeletion: false
