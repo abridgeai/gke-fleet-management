@@ -16,6 +16,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"text/template"
 	"time"
@@ -210,6 +211,32 @@ func (c *FleetSync) Refresh(ctx context.Context) error {
 		scopeTenancyMap[scope] = append(scopeTenancyMap[scope], membership)
 	}
 
+	// Log per-region binding distribution to help detect silent partial responses
+	// where the API returns fewer bindings without marking locations as unreachable.
+	regionBindings := make(map[string]int)
+	for _, binding := range mbs {
+		parts := strings.Split(binding.Name, "/")
+		if len(parts) >= 4 {
+			regionBindings[parts[3]]++
+		}
+	}
+	log.Printf("Refresh: fleet topology — %d memberships, %d scopes, %d bindings (by region: %v)",
+		len(mems), len(scopes), len(mbs), regionBindings)
+
+	if c.ScopeTenancyMapCache != nil {
+		prevTotal := 0
+		for _, members := range c.ScopeTenancyMapCache {
+			prevTotal += len(members)
+		}
+		newTotal := 0
+		for _, members := range scopeTenancyMap {
+			newTotal += len(members)
+		}
+		if prevTotal > 0 && newTotal < prevTotal {
+			log.Printf("Refresh: WARNING — scope-to-membership mapping shrank from %d to %d total entries; possible silent partial API response", prevTotal, newTotal)
+		}
+	}
+
 	// Refresh cache.
 	c.MembershipTenancyMapCache = memTenancyMap
 	c.ScopeTenancyMapCache = scopeTenancyMap
@@ -341,17 +368,36 @@ func secretFromManifest(manifest string) (*corev1.Secret, error) {
 }
 
 // listMemberships fetches the memberships under a given parent.
+// Returns an error if any locations are reported as unreachable, to prevent
+// partial data from being treated as the complete fleet topology.
 func (c *FleetSync) listMemberships(ctx context.Context, project string) ([]*fleet.Membership, error) {
 	var ret []*fleet.Membership
+	var unreachableLocations []string
 	parent := fmt.Sprintf("projects/%s/locations/-", project)
 	call := c.svc.Projects.Locations.Memberships.List(parent)
 	err := call.Pages(ctx, func(resp *fleet.ListMembershipsResponse) error {
 		ret = append(ret, resp.Resources...)
+		unreachableLocations = append(unreachableLocations, resp.Unreachable...)
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+
+	regionCount := make(map[string]int)
+	for _, mem := range ret {
+		parts := strings.Split(mem.Name, "/")
+		if len(parts) >= 4 {
+			regionCount[parts[3]]++
+		}
+	}
+	log.Printf("ListMemberships: returned %d memberships across %d regions (by region: %v)", len(ret), len(regionCount), regionCount)
+
+	if len(unreachableLocations) > 0 {
+		log.Printf("ListMemberships: UNREACHABLE locations detected: %v", unreachableLocations)
+		return nil, fmt.Errorf("ListMemberships returned partial data: %d unreachable locations: %v — aborting to prevent treating partial data as complete", len(unreachableLocations), unreachableLocations)
+	}
+
 	return ret, nil
 }
 
@@ -367,20 +413,47 @@ func (c *FleetSync) listScopes(ctx context.Context, project string) ([]*fleet.Sc
 	if err != nil {
 		return nil, err
 	}
+
+	scopeNames := make([]string, 0, len(ret))
+	for _, s := range ret {
+		parts := strings.Split(s.Name, "/")
+		scopeNames = append(scopeNames, parts[len(parts)-1])
+	}
+	log.Printf("ListScopes: returned %d scopes: %v", len(ret), scopeNames)
+
 	return ret, nil
 }
 
 // listMembershipBindings fetches the membership bindings under a given parent.
+// Returns an error if any locations are reported as unreachable, to prevent
+// partial data from being treated as the complete set of bindings.
 func (c *FleetSync) listMembershipBindings(ctx context.Context, project string) ([]*fleet.MembershipBinding, error) {
 	var ret []*fleet.MembershipBinding
+	var unreachableLocations []string
 	parent := fmt.Sprintf("projects/%s/locations/-/memberships/-", project)
 	call := c.svc.Projects.Locations.Memberships.Bindings.List(parent)
 	err := call.Pages(ctx, func(resp *fleet.ListMembershipBindingsResponse) error {
 		ret = append(ret, resp.MembershipBindings...)
+		unreachableLocations = append(unreachableLocations, resp.Unreachable...)
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+
+	regionBindingCount := make(map[string]int)
+	for _, binding := range ret {
+		parts := strings.Split(binding.Name, "/")
+		if len(parts) >= 4 {
+			regionBindingCount[parts[3]]++
+		}
+	}
+	log.Printf("ListMembershipBindings: returned %d bindings across %d regions (by region: %v)", len(ret), len(regionBindingCount), regionBindingCount)
+
+	if len(unreachableLocations) > 0 {
+		log.Printf("ListMembershipBindings: UNREACHABLE locations detected: %v", unreachableLocations)
+		return nil, fmt.Errorf("ListMembershipBindings returned partial data: %d unreachable locations: %v — aborting to prevent treating partial data as complete", len(unreachableLocations), unreachableLocations)
+	}
+
 	return ret, nil
 }
