@@ -1,0 +1,24 @@
+name: Lint ArgoCD Hooks
+
+# Non-blocking guard: fails a PR when an ArgoCD hook / hook-delete-policy
+# annotation sits on a non-ephemeral resource kind (see
+# abridgeai/github-templates actions/lint-argocd-hooks). Static scan, no render.
+#
+# merge_group is included so the check is queue-safe from day one: if the
+# "argocd-hook-lint / gate" context is later made a required status check, the
+# gate still reports on the merge-queue ref (it skips the scan and passes there).
+on:
+  pull_request:
+    paths:
+      - 'fleet-charts/**'
+      - '.github/workflows/lint-argocd-hooks.yml'
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  argocd-hook-lint:
+    uses: abridgeai/github-templates/.github/workflows/argocd-hook-lint.yml@v7
+    with:
+      charts: '[{"name":"argocd-clusterprofile-syncer","path":"fleet-charts/argocd-clusterprofile-syncer"},{"name":"argocd-mco-plugin","path":"fleet-charts/argocd-mco-plugin"},{"name":"gemma-server","path":"fleet-charts/gemma-server"},{"name":"hello-world","path":"fleet-charts/hello-world"},{"name":"orchestrator","path":"fleet-charts/orchestrator"}]'
