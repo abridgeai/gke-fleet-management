@@ -22,3 +22,5 @@ jobs:
     uses: abridgeai/github-templates/.github/workflows/argocd-hook-lint.yml@v7
     with:
       charts: '[{"name":"argocd-clusterprofile-syncer","path":"fleet-charts/argocd-clusterprofile-syncer"},{"name":"argocd-mco-plugin","path":"fleet-charts/argocd-mco-plugin"},{"name":"gemma-server","path":"fleet-charts/gemma-server"},{"name":"hello-world","path":"fleet-charts/hello-world"},{"name":"orchestrator","path":"fleet-charts/orchestrator"}]'
+
+# re-trigger after github-templates v7.50.0
