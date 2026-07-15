@@ -49,8 +49,9 @@ metadata:
 type: Opaque
 stringData:
   name: {{.Name}}
-  server: {{.ConnectGatewayURL}}
+  server: {{.ServerURL}}
   config: |
+{{- if .UseExecAuth }}
     {
       "execProviderConfig": {
         "command": "argocd-k8s-auth",
@@ -62,7 +63,18 @@ stringData:
         "caData": ""
       }
     }
+{{- else }}
+    {
+      "tlsClientConfig": {
+        "insecure": false
+      }
+    }
+{{- end }}
 `
+	// kubernetesInternalAPIServerAddr is ArgoCD's well-known in-cluster server
+	// address; a cluster secret with this server uses ArgoCD's mounted service
+	// account instead of exec-based auth.
+	kubernetesInternalAPIServerAddr = "https://kubernetes.default.svc"
 )
 
 // FleetSync is a client that periodically polls the GKE Fleet API and caches fleet information.
@@ -70,6 +82,10 @@ type FleetSync struct {
 	svc *fleet.Service
 	// GCP project number of fleet host project.
 	ProjectNum string
+	// ServerOverrides maps a membership ID to a server URL to use instead of
+	// the Connect Gateway URL, e.g. the in-cluster address for the local
+	// cluster so its traffic does not consume Connect Gateway quota.
+	ServerOverrides map[string]string
 	// A cached map from Membership full resource name to a list of Scope IDs.
 	MembershipTenancyMapCache map[string][]string
 	// A cached map from Scope IDs to a list of Membership full resource names.
@@ -77,14 +93,15 @@ type FleetSync struct {
 }
 
 // NewFleetSync creates a new FleetSync and starts its periodical reconciliation.
-func NewFleetSync(ctx context.Context, projectNum string) (*FleetSync, error) {
+func NewFleetSync(ctx context.Context, projectNum string, serverOverrides map[string]string) (*FleetSync, error) {
 	service, err := fleet.NewService(ctx)
 	if err != nil {
 		return nil, err
 	}
 	c := &FleetSync{
-		svc:        service,
-		ProjectNum: projectNum,
+		svc:             service,
+		ProjectNum:      projectNum,
+		ServerOverrides: serverOverrides,
 	}
 
 	// Build the initial fleet topology before handling RPCs.
@@ -127,26 +144,35 @@ func (c *FleetSync) PluginResults(ctx context.Context, scopeID string) ([]Result
 			return nil, fmt.Errorf("unknown scope ID to the Fleet plugin: %s", scopeID)
 		}
 		for _, name := range c.ScopeTenancyMapCache[scopeID] {
-			results = append(results, resultFromMembership(name, c.ProjectNum))
+			results = append(results, c.resultFromMembership(name))
 		}
 		return results, nil
 	}
 
 	// Include all member clusters in the Fleet.
 	for name := range c.MembershipTenancyMapCache {
-		results = append(results, resultFromMembership(name, c.ProjectNum))
+		results = append(results, c.resultFromMembership(name))
 	}
 	return results, nil
 }
 
-func resultFromMembership(name, projectNum string) Result {
+func (c *FleetSync) resultFromMembership(name string) Result {
 	parts := strings.Split(name, "/")
 	region, membershipID := parts[3], parts[5]
 	return Result{
-		ServerURL: connectGatewayURL(projectNum, region, membershipID),
-		Name:      fmt.Sprintf(clusterSecretNameTemplate, membershipID, region, projectNum),
+		ServerURL: c.serverURL(region, membershipID),
+		Name:      fmt.Sprintf(clusterSecretNameTemplate, membershipID, region, c.ProjectNum),
 		NameShort: fmt.Sprint(membershipID),
 	}
+}
+
+// serverURL returns the override for the membership if configured, otherwise
+// the Connect Gateway URL.
+func (c *FleetSync) serverURL(region, membershipID string) string {
+	if url, ok := c.ServerOverrides[membershipID]; ok {
+		return url
+	}
+	return connectGatewayURL(c.ProjectNum, region, membershipID)
 }
 
 func connectGatewayURL(projectNum, region, membershipID string) string {
@@ -237,12 +263,15 @@ func (c *FleetSync) reconcileClusterSecrets(ctx context.Context) error {
 	for membership := range c.MembershipTenancyMapCache {
 		parts := strings.Split(membership, "/")
 		secretName := fmt.Sprintf(clusterSecretNameTemplate, parts[5], parts[3], c.ProjectNum)
+		serverURL := c.serverURL(parts[3], parts[5])
 		param := struct {
-			Name              string
-			ConnectGatewayURL string
+			Name        string
+			ServerURL   string
+			UseExecAuth bool
 		}{
-			Name:              secretName,
-			ConnectGatewayURL: connectGatewayURL(c.ProjectNum, parts[3], parts[5]),
+			Name:        secretName,
+			ServerURL:   serverURL,
+			UseExecAuth: serverURL != kubernetesInternalAPIServerAddr,
 		}
 		tmpl, err := template.New("secret").Parse(clusterSecretTemplate)
 		if err != nil {

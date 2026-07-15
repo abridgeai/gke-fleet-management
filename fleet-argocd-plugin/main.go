@@ -21,6 +21,7 @@ import (
 	"log"      // logging messages to the console.
 	"net/http" // Used for build HTTP servers and clients.
 	"os"
+	"strings"
 )
 
 var fleetSync *fleetclient.FleetSync
@@ -35,10 +36,16 @@ func main() {
 	if portNum == "" {
 		log.Fatal("ENV var PORT not found")
 	}
+	serverOverrides, err := parseServerOverrides(os.Getenv("FLEET_MEMBERSHIP_SERVER_OVERRIDES"))
+	if err != nil {
+		log.Fatalf("Invalid FLEET_MEMBERSHIP_SERVER_OVERRIDES: %v", err)
+	}
+	if len(serverOverrides) > 0 {
+		log.Printf("Using membership server overrides: %v", serverOverrides)
+	}
 	// Start fleet client.
 	ctx := context.Background()
-	var err error
-	fleetSync, err = fleetclient.NewFleetSync(ctx, projectNum)
+	fleetSync, err = fleetclient.NewFleetSync(ctx, projectNum, serverOverrides)
 	if err != nil {
 		fmt.Printf("Error creating fleet client: %v\n", err)
 		log.Fatal(err)
@@ -51,6 +58,30 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+}
+
+// parseServerOverrides parses FLEET_MEMBERSHIP_SERVER_OVERRIDES, a
+// comma-separated list of membershipID=serverURL pairs that replace the
+// Connect Gateway URL for the named memberships (e.g.
+// "my-cluster=https://kubernetes.default.svc" for the local cluster).
+func parseServerOverrides(raw string) (map[string]string, error) {
+	overrides := map[string]string{}
+	if strings.TrimSpace(raw) == "" {
+		return overrides, nil
+	}
+	for _, pair := range strings.Split(raw, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		id, url, ok := strings.Cut(pair, "=")
+		id, url = strings.TrimSpace(id), strings.TrimSpace(url)
+		if !ok || id == "" || !strings.HasPrefix(url, "https://") {
+			return nil, fmt.Errorf("expected membershipID=https://server-url, got %q", pair)
+		}
+		overrides[id] = url
+	}
+	return overrides, nil
 }
 
 // PluginRequest is the request object sent to the plugin generator service.
