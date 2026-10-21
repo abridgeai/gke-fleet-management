@@ -23,14 +23,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o sy
 
 # Use distroless as minimal base image to package the syncer binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
-# eMudhra CA advisory (SECRES-271): the distroless images have not been rebuilt with the fixed
-# ca-certificates yet, so take the bundle from Debian (bookworm-security ships 20250419~deb12u2).
-# Drop this stage and the COPY below once distroless publishes rebuilt images.
-FROM debian:bookworm-slim AS certs
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
-
 FROM gcr.io/distroless/static:nonroot
-COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 WORKDIR /
 COPY --from=builder /workspace/syncer .
 USER 65532:65532
