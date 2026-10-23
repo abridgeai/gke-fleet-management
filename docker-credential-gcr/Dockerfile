@@ -13,7 +13,7 @@ FROM alpine:3.20 AS fetch
 ARG GCR_VERSION
 # Throwaway fetch stage; pinning alpine pkg versions just ages out of the repo.
 # hadolint ignore=DL3018
-RUN apk add --no-cache curl tar \
+RUN apk add --no-cache --upgrade ca-certificates curl tar \
  && curl -fsSL -o /tmp/gcr.tgz \
     "https://github.com/GoogleCloudPlatform/docker-credential-gcr/releases/download/v${GCR_VERSION}/docker-credential-gcr_linux_amd64-${GCR_VERSION}.tar.gz" \
  && tar -xzf /tmp/gcr.tgz -C /usr/local/bin docker-credential-gcr \
